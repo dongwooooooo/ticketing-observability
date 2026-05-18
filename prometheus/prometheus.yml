@@ -1,0 +1,34 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: ticketing-observability
+
+scrape_configs:
+  - job_name: ticketing-stage
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - host.docker.internal:28080
+        labels:
+          stage: basic
+      - targets:
+          - host.docker.internal:28081
+        labels:
+          stage: concurrency
+      - targets:
+          - host.docker.internal:28082
+        labels:
+          stage: queue
+
+  - job_name: pushgateway
+    honor_labels: true
+    static_configs:
+      - targets:
+          - pushgateway:9091
+
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090
