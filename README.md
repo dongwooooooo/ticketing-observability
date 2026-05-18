@@ -13,9 +13,9 @@ ticketing 메인 프로젝트의 3개 Stage (basic / concurrency / queue) 부하
 | k6 | grafana/k6:0.53.0 | — | 부하 도구 (profiles=tools, 수동 실행) |
 
 Stage 앱 (본 stack 범위 외, 호스트에서 별도 기동):
-- Stage 1 basic — `host.docker.internal:8080`
-- Stage 2 concurrency — `host.docker.internal:8081`
-- Stage 3 queue — `host.docker.internal:8082`
+- **Stage 1 basic** — `host.docker.internal:8080`. 사용자가 좌석 100번 클릭 → 락 없는 단순 `seatRepository.findById` + INSERT. 같은 좌석 클릭한 사용자 여러 명이 동시에 "예매 성공" 응답을 받는다 → DB 에 HELD reservation 이 여러 건 (oversell 발생). 이 실패 모드를 메트릭으로 노출.
+- **Stage 2 concurrency** — `host.docker.internal:8081`. 비관적 락 (`@Lock PESSIMISTIC_WRITE`) + partial UNIQUE 2단 방어. 같은 좌석 클릭한 100명 중 1명만 "선점됨", 99명은 "이미 선점됨" 응답. race 차단 정확도와 p99 응답 시간을 메트릭으로 노출.
+- **Stage 3 queue** — `host.docker.internal:8082`. 사용자가 "예매 시작" 클릭 시 backend 좌석 API 가 아닌 대기열로 진입. 화면에 "내 앞 N명" 표시. `ticketing_waiting_queue_depth` 게이지로 대기열 길이를 실시간 노출.
 
 Spring Boot Prometheus endpoint: `/actuator/prometheus`
 
