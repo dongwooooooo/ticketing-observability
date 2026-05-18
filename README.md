@@ -3,6 +3,15 @@
 ticketing 메인 프로젝트의 3개 Stage (basic / concurrency / queue) 부하 측정용
 관측 스택. Prometheus + Grafana + Pushgateway + k6 를 docker compose 로 묶음.
 
+**전체 26 시나리오 통합 정리 (사용자 행동 형식)**: [Notion 부하 측정 시나리오 페이지](https://www.notion.so/36473344235881adbdf7d64842f9a539)
+**관련 레포**: [`ticketing`](https://github.com/dongwooooooo/ticketing) (메인) · [`seat-lock-alternatives`](https://github.com/dongwooooooo/seat-lock-alternatives) · [`queue-alternatives`](https://github.com/dongwooooooo/queue-alternatives)
+
+## Stage 1/2/3 측정 스크린샷
+
+[`screenshots/stage1-grafana-overview.png`](screenshots/stage1-grafana-overview.png) — Stage 1 (basic) race 재현, oversell=9
+[`screenshots/stage2-grafana-overview.png`](screenshots/stage2-grafana-overview.png) — Stage 2 (concurrency) race 차단 + sustained 부하, p99 178ms
+[`screenshots/stage3-grafana-overview.png`](screenshots/stage3-grafana-overview.png) — Stage 3 (queue) gate 동작, queue depth peak 40
+
 ## 스택 구성 / 포트 매핑
 
 | 서비스 | 이미지 | 호스트 포트 | 용도 |
