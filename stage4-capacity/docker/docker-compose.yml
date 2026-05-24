@@ -1,0 +1,149 @@
+name: stage4-capacity
+
+# Stage 4 capacity probe — distributed 모듈 (backend × 2 + Redis 분산 큐/락 + Nginx LB).
+#
+# Mac 호스트 한계 (10 cpu / 16GB / Docker 8GB) 안에서 측정:
+#   backend × 2 (각 2cpu × 2 = 4 cpu)
+#   Nginx LB (0.5 cpu)
+#   Redis (1 cpu)
+#   PostgreSQL (2 cpu)
+#   k6 (호스트에서 실행, ~0.5 cpu)
+#   macOS / Docker overhead (1~2 cpu)
+#   ----
+#   합 ~10 cpu (한계 안)
+#
+# 측정 핵심:
+#  - backend × 2 vs Stage 3 단일 (수평 확장 효과)
+#  - 인스턴스 1대 다운 시 LB 가 자동 인계 (실패 없이 흐름 유지)
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: stage4cap-postgres
+    environment:
+      POSTGRES_DB: ticketing
+      POSTGRES_USER: ticketing
+      POSTGRES_PASSWORD: ticketing
+    ports:
+      - "5546:5432"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "max_connections=200"
+    deploy:
+      resources:
+        limits:
+          cpus: "${DB_CPU:-2}"
+          memory: "${DB_MEM:-2g}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ticketing -d ticketing"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    networks:
+      - stage4cap-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: stage4cap-redis
+    ports:
+      - "6399:6379"
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    deploy:
+      resources:
+        limits:
+          cpus: "${REDIS_CPU:-1}"
+          memory: "${REDIS_MEM:-1g}"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    networks:
+      - stage4cap-net
+
+  app1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stage4cap-app:latest
+    container_name: stage4cap-app1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ticketing
+      SPRING_DATASOURCE_USERNAME: ticketing
+      SPRING_DATASOURCE_PASSWORD: ticketing
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "${POOL_SIZE:-10}"
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PORT: "6379"
+      JAVA_OPTS: "${JAVA_OPTS:--Xmx1500m -XX:+UseG1GC}"
+      SERVER_PORT: "28083"
+      QUEUE_ADMIT_RATE_PER_TICK: "${ADMIT_RATE_PER_TICK:-100}"
+      INSTANCE_ID: "app1"
+      PG_CALLBACK_URL: "http://lb:80/payments/callback"
+    deploy:
+      resources:
+        limits:
+          cpus: "${APP_CPU:-2}"
+          memory: "${APP_MEM:-2g}"
+    networks:
+      - stage4cap-net
+
+  app2:
+    image: stage4cap-app:latest
+    container_name: stage4cap-app2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      app1:
+        condition: service_started
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ticketing
+      SPRING_DATASOURCE_USERNAME: ticketing
+      SPRING_DATASOURCE_PASSWORD: ticketing
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "${POOL_SIZE:-10}"
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PORT: "6379"
+      JAVA_OPTS: "${JAVA_OPTS:--Xmx1500m -XX:+UseG1GC}"
+      SERVER_PORT: "28083"
+      QUEUE_ADMIT_RATE_PER_TICK: "${ADMIT_RATE_PER_TICK:-100}"
+      INSTANCE_ID: "app2"
+      PG_CALLBACK_URL: "http://lb:80/payments/callback"
+    deploy:
+      resources:
+        limits:
+          cpus: "${APP_CPU:-2}"
+          memory: "${APP_MEM:-2g}"
+    networks:
+      - stage4cap-net
+
+  lb:
+    image: nginx:1.27-alpine
+    container_name: stage4cap-lb
+    depends_on:
+      - app1
+      - app2
+    ports:
+      - "28093:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "256m"
+    networks:
+      - stage4cap-net
+
+networks:
+  stage4cap-net:
+    name: stage4cap-net
+    driver: bridge
