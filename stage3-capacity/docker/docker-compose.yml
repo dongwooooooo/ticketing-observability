@@ -1,0 +1,68 @@
+name: stage3-capacity
+
+# Stage 3 capacity probe — queue 모듈 (큐 + admit gate) 수직 확장 측정 스택.
+# Stage 2 와 완전 분리 (다른 project name, network, port).
+#
+# admit-rate-per-tick 은 Stage 2 측정 결과(단일 노드 peak ~1200 req/s) 기준 100 (=1000/s) 고정.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: stage3cap-postgres
+    environment:
+      POSTGRES_DB: ticketing
+      POSTGRES_USER: ticketing
+      POSTGRES_PASSWORD: ticketing
+    ports:
+      - "5545:5432"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "max_connections=200"
+    deploy:
+      resources:
+        limits:
+          cpus: "${DB_CPU:-4}"
+          memory: "${DB_MEM:-4g}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ticketing -d ticketing"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    networks:
+      - stage3cap-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stage3cap-app:latest
+    container_name: stage3cap-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "28092:28082"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ticketing
+      SPRING_DATASOURCE_USERNAME: ticketing
+      SPRING_DATASOURCE_PASSWORD: ticketing
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "${POOL_SIZE:-10}"
+      SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT: "3000"
+      JAVA_OPTS: "${JAVA_OPTS:--Xmx1g -XX:+UseG1GC}"
+      SERVER_PORT: "28082"
+      QUEUE_ADMIT_RATE_PER_TICK: "${ADMIT_RATE_PER_TICK:-100}"
+    deploy:
+      resources:
+        limits:
+          cpus: "${CPU_LIMIT:-1}"
+          memory: "${MEM_LIMIT:-2g}"
+    networks:
+      - stage3cap-net
+
+networks:
+  stage3cap-net:
+    name: stage3cap-net
+    driver: bridge

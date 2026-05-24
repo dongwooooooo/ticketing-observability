@@ -1,0 +1,2 @@
+stage3cap-app 1.64% 2.484GiB / 4GiB 62.10%
+stage3cap-postgres 2.34% 183.1MiB / 3GiB 5.96%

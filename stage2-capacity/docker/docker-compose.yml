@@ -1,0 +1,72 @@
+name: stage2-capacity
+
+# Stage 2 capacity probe — Docker cgroups 기반 수직 확장 한계 측정 스택.
+# 기존 ticketing-observability 스택과 완전 분리 (다른 project name + 다른 network + 다른 port).
+#
+# 사용법:
+#   SPEC=spec-1 docker compose -f docker/docker-compose.yml up -d
+#   SPEC=spec-2 docker compose -f docker/docker-compose.yml up -d
+#   ...
+# SPEC 환경변수에 따라 CPU/MEM limit, HikariCP pool, JVM heap이 분기된다.
+# (실제 분기는 run-spec.sh 스크립트에서 export 하여 주입)
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: stage2cap-postgres
+    environment:
+      POSTGRES_DB: ticketing
+      POSTGRES_USER: ticketing
+      POSTGRES_PASSWORD: ticketing
+    ports:
+      - "5544:5432"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "max_connections=200"
+    deploy:
+      resources:
+        limits:
+          cpus: "${DB_CPU:-4}"
+          memory: "${DB_MEM:-4g}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ticketing -d ticketing"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    networks:
+      - stage2cap-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stage2cap-app:latest
+    container_name: stage2cap-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "28091:28081"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ticketing
+      SPRING_DATASOURCE_USERNAME: ticketing
+      SPRING_DATASOURCE_PASSWORD: ticketing
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "${POOL_SIZE:-10}"
+      SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT: "3000"
+      JAVA_OPTS: "${JAVA_OPTS:--Xmx1g -XX:+UseG1GC}"
+      SERVER_PORT: "28081"
+    deploy:
+      resources:
+        limits:
+          cpus: "${CPU_LIMIT:-1}"
+          memory: "${MEM_LIMIT:-2g}"
+    networks:
+      - stage2cap-net
+
+networks:
+  stage2cap-net:
+    name: stage2cap-net
+    driver: bridge

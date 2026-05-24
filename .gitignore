@@ -1,3 +1,11 @@
 .DS_Store
 grafana-storage/
 prometheus-data/
+stage*-capacity/results/*/k6-stdout.txt
+stage*-capacity/results/*/docker-stats-stream.txt
+stage*-capacity/results/*/app-logs.txt
+stage*-capacity/results/*/actuator-prometheus.txt
+stage*-capacity/results/*-run.log
+stage*-capacity/results/run-all.log
+stage*-capacity/docker/*.jar
+stage*-capacity/results-*/
