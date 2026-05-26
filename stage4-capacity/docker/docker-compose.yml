@@ -20,6 +20,8 @@ services:
   postgres:
     image: postgres:16
     container_name: stage4cap-postgres
+    cpus: "${DB_CPU:-2}"
+    mem_limit: "${DB_MEM:-2g}"
     environment:
       POSTGRES_DB: ticketing
       POSTGRES_USER: ticketing
@@ -48,19 +50,47 @@ services:
   redis:
     image: redis:7-alpine
     container_name: stage4cap-redis
+    cpus: "${REDIS_CPU:-2}"
+    mem_limit: "${REDIS_MEM:-2g}"
     ports:
       - "6399:6379"
     command: ["redis-server", "--appendonly", "no", "--save", ""]
     deploy:
       resources:
         limits:
-          cpus: "${REDIS_CPU:-1}"
-          memory: "${REDIS_MEM:-1g}"
+          cpus: "${REDIS_CPU:-2}"
+          memory: "${REDIS_MEM:-2g}"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 2s
       retries: 20
+    networks:
+      - stage4cap-net
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    container_name: stage4cap-redis-exporter
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    ports:
+      - "${REDIS_EXPORTER_PORT:-9121}:9121"
+    networks:
+      - stage4cap-net
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: stage4cap-postgres-exporter
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_NAME: "postgresql://ticketing:ticketing@postgres:5432/ticketing?sslmode=disable"
+    ports:
+      - "${POSTGRES_EXPORTER_PORT:-9187}:9187"
     networks:
       - stage4cap-net
 
@@ -70,6 +100,10 @@ services:
       dockerfile: Dockerfile
     image: stage4cap-app:latest
     container_name: stage4cap-app1
+    cpus: "${APP_CPU:-2}"
+    mem_limit: "${APP_MEM:-2g}"
+    ports:
+      - "${APP1_HTTP_PORT:-28083}:28083"
     depends_on:
       postgres:
         condition: service_healthy
@@ -98,6 +132,10 @@ services:
   app2:
     image: stage4cap-app:latest
     container_name: stage4cap-app2
+    cpus: "${APP_CPU:-2}"
+    mem_limit: "${APP_MEM:-2g}"
+    ports:
+      - "${APP2_HTTP_PORT:-28084}:28083"
     depends_on:
       postgres:
         condition: service_healthy
@@ -128,13 +166,15 @@ services:
   lb:
     image: nginx:1.27-alpine
     container_name: stage4cap-lb
+    cpus: "${NGINX_CPU:-0.5}"
+    mem_limit: "${NGINX_MEM:-256m}"
     depends_on:
       - app1
       - app2
     ports:
       - "28093:80"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${NGINX_CONF:-./nginx.dual.conf}:/etc/nginx/nginx.conf:ro
     deploy:
       resources:
         limits:

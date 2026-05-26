@@ -166,7 +166,9 @@ case "$SPEC" in
 esac
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-RESULTS="${ROOT}/results/${SPEC}"
+RESULT_DIR="${RESULT_DIR:-${SPEC}}"
+RESULTS="${ROOT}/results/${RESULT_DIR}"
+K6_SPEC="${K6_SPEC:-stage2-${SPEC}}"
 mkdir -p "${RESULTS}"
 
 echo "=== ${SPEC}: CPU=${CPU_LIMIT} MEM=${MEM_LIMIT} POOL=${POOL_SIZE} JAVA_OPTS=${JAVA_OPTS}"
@@ -212,23 +214,48 @@ STATS_PID=$!
 echo "--- k6 probe (host network; results → ${RESULTS}/)"
 # k6 runs from host (brew install k6) — bypasses docker network entanglement.
 # Falls back to dockerized k6 if local k6 unavailable.
+K6_OUTPUT_ARGS=()
+K6_REMOTE_WRITE="${K6_REMOTE_WRITE:-auto}"
+K6_SUMMARY_TREND_STATS="${K6_SUMMARY_TREND_STATS:-avg,min,med,max,p(90),p(95),p(99)}"
+if [[ "$K6_REMOTE_WRITE" != "0" ]]; then
+  if curl -sf "http://localhost:9090/-/ready" >/dev/null 2>&1; then
+    export K6_PROMETHEUS_RW_SERVER_URL="${K6_PROMETHEUS_RW_SERVER_URL:-http://localhost:9090/api/v1/write}"
+    export K6_PROMETHEUS_RW_TREND_STATS="${K6_PROMETHEUS_RW_TREND_STATS:-p(95),p(99),min,max}"
+    K6_OUTPUT_ARGS=(-o experimental-prometheus-rw)
+    echo "--- k6 remote write enabled: ${K6_PROMETHEUS_RW_SERVER_URL}"
+  elif [[ "$K6_REMOTE_WRITE" == "1" ]]; then
+    echo "ERROR: K6_REMOTE_WRITE=1 but Prometheus is not ready at http://localhost:9090" >&2
+    exit 2
+  fi
+fi
+K6_EXIT=0
 if command -v k6 >/dev/null 2>&1; then
-  k6 run \
+  k6 run "${K6_OUTPUT_ARGS[@]}" \
+    --summary-trend-stats "$K6_SUMMARY_TREND_STATS" \
     -e HOST="localhost:28091" \
-    -e SPEC="${SPEC}" \
+    -e SPEC="${K6_SPEC}" \
     -e SEAT_MAX=50000 \
     --summary-export "${RESULTS}/summary.json" \
-    "${ROOT}/k6/capacity-probe.js" 2>&1 | tee "${RESULTS}/k6-stdout.txt"
+    "${ROOT}/k6/capacity-probe.js" 2>&1 | tee "${RESULTS}/k6-stdout.txt" || K6_EXIT=$?
 else
   docker run --rm --network host \
     -v "${ROOT}/k6:/scripts:ro" \
     -v "${RESULTS}:/results" \
     -e HOST="localhost:28091" \
-    -e SPEC="${SPEC}" \
+    -e SPEC="${K6_SPEC}" \
     -e SEAT_MAX=50000 \
     grafana/k6:0.53.0 run \
+      --summary-trend-stats "$K6_SUMMARY_TREND_STATS" \
       --summary-export "/results/summary.json" \
-      /scripts/capacity-probe.js 2>&1 | tee "${RESULTS}/k6-stdout.txt"
+      /scripts/capacity-probe.js 2>&1 | tee "${RESULTS}/k6-stdout.txt" || K6_EXIT=$?
+fi
+echo "--- k6 exit code: ${K6_EXIT}" | tee -a "${RESULTS}/meta.txt"
+
+if [[ "${#K6_OUTPUT_ARGS[@]}" -gt 0 ]]; then
+  TIMESERIES_PATH="screenshots/portfolio-evidence/prometheus-timeseries/${K6_SPEC}.json"
+  echo "--- export Prometheus time series: ${TIMESERIES_PATH}"
+  (cd "$ROOT/.." && ./scripts/export-prometheus-timeseries.mjs --spec "$K6_SPEC" --out "$TIMESERIES_PATH") \
+    || echo "WARN: Prometheus time series export failed (summary/log retained)"
 fi
 
 echo "--- stop docker stats collector"

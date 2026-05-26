@@ -19,6 +19,8 @@ import http from 'k6/http';
 import { check } from 'k6';
 import { Counter, Trend, Rate } from 'k6/metrics';
 
+http.setResponseCallback(http.expectedStatuses({ min: 200, max: 399 }, 409));
+
 const HOST = __ENV.HOST || 'localhost:28091';
 const SPEC = __ENV.SPEC || 'unknown';
 const SEAT_MAX = parseInt(__ENV.SEAT_MAX || 1000);
@@ -31,6 +33,7 @@ const errorRate = new Rate('error_rate');
 const serverErr = new Rate('server_5xx');
 
 export const options = {
+  systemTags: ['status', 'method', 'name', 'scenario', 'expected_response'],
   scenarios: {
     ramp: {
       executor: 'ramping-arrival-rate',
@@ -61,7 +64,7 @@ export default function () {
   const userId = `cap-${__VU}-${__ITER}-${Date.now()}`;
   const res = http.post(`http://${HOST}/seats/${seat}/reservations`, null, {
     headers: { 'X-User-Id': userId },
-    tags: { spec: SPEC },
+    tags: { spec: SPEC, step: 'reserve', name: 'POST /seats/{seatId}/reservations' },
     timeout: '10s',
   });
   latency.add(res.timings.duration);
@@ -98,7 +101,5 @@ p50=${p50.toFixed(1)}ms p95=${p95.toFixed(1)}ms p99=${p99.toFixed(1)}ms max=${ma
 `;
   return {
     stdout: text,
-    [`/results/${SPEC}/summary.json`]: JSON.stringify(data, null, 2),
-    [`/results/${SPEC}/summary.txt`]: text,
   };
 }

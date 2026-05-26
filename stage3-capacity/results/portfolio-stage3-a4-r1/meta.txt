@@ -1,0 +1,4 @@
+=== started at 2026-05-27T02:06:42+09:00
+CPU_LIMIT=4 MEM_LIMIT=4g POOL_SIZE=50 DB_CPU=4 DB_MEM=3g ADMIT_RATE_PER_TICK=100 JAVA_OPTS='-Xmx3g -Xms3g -XX:+UseG1GC -XX:MaxGCPauseMillis=200'
+--- k6 exit code: 0
+=== a-4 done at 2026-05-27T02:09:53+09:00

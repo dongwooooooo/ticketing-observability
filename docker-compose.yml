@@ -8,8 +8,11 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
-      - "--storage.tsdb.retention.time=6h"
+      - "--storage.tsdb.retention.time=365d"
+      - "--storage.tsdb.retention.size=20GB"
       - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+      - "--web.enable-remote-write-receiver"
     ports:
       - "9090:9090"
     volumes:
@@ -48,6 +51,20 @@ services:
     restart: unless-stopped
     ports:
       - "9091:9091"
+    networks:
+      - ticketing-observability
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: ticketing-obs-cadvisor
+    restart: unless-stopped
+    ports:
+      - "8088:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
     networks:
       - ticketing-observability
 

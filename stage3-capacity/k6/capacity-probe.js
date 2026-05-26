@@ -17,6 +17,8 @@ import http from 'k6/http';
 import { sleep } from 'k6';
 import { Counter, Trend } from 'k6/metrics';
 
+http.setResponseCallback(http.expectedStatuses({ min: 200, max: 399 }, 409));
+
 const HOST = __ENV.HOST || 'localhost:28092';
 const SPEC = __ENV.SPEC || 'unknown';
 const SEAT_MAX = parseInt(__ENV.SEAT_MAX || 50000);
@@ -34,6 +36,7 @@ const tokenLatency = new Trend('token_latency_ms', true);
 const reserveLatency = new Trend('reserve_latency_ms', true);
 
 export const options = {
+  systemTags: ['status', 'method', 'name', 'scenario', 'expected_response'],
   scenarios: {
     ramp: {
       executor: 'ramping-arrival-rate',
@@ -54,6 +57,8 @@ export const options = {
   },
   thresholds: {
     'total_latency_ms': ['p(99)<60000'],
+    'admit_wait_ms': ['p(95)<30000'],
+    'admit_timeout': ['count==0'],
   },
 };
 
@@ -65,7 +70,7 @@ export default function () {
   const tokenRes = http.post(`http://${HOST}/waiting/tokens`, null, {
     headers: { 'X-User-Id': userId },
     timeout: '10s',
-    tags: { step: 'token' },
+    tags: { step: 'token', name: 'POST /waiting/tokens' },
   });
   tokenLatency.add(tokenRes.timings.duration);
   if (tokenRes.status !== 200 && tokenRes.status !== 201) {
@@ -92,7 +97,7 @@ export default function () {
   for (let i = 0; i < 30; i++) {
     const statusRes = http.get(`http://${HOST}/waiting/tokens/${token}`, {
       timeout: '5s',
-      tags: { step: 'status' },
+      tags: { step: 'status', name: 'GET /waiting/tokens/{token}' },
     });
     if (statusRes.status === 200) {
       try {
@@ -119,7 +124,7 @@ export default function () {
   const reserveRes = http.post(`http://${HOST}/seats/${seat}/reservations`, null, {
     headers: { 'X-User-Id': userId, 'X-Waiting-Token': token },
     timeout: '10s',
-    tags: { step: 'reserve' },
+    tags: { step: 'reserve', name: 'POST /seats/{seatId}/reservations' },
   });
   reserveLatency.add(reserveRes.timings.duration);
   totalLatency.add(Date.now() - start);
@@ -164,6 +169,5 @@ total_latency_ms p50=${tl50.toFixed(0)} p95=${tl95.toFixed(0)} p99=${tl99.toFixe
 `;
   return {
     stdout: text,
-    [`/results/${SPEC}/summary.txt`]: text,
   };
 }

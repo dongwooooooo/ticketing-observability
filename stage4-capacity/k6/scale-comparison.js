@@ -1,26 +1,31 @@
-// Stage 4 capacity probe — backend × 2 + Nginx LB + Redis 분산 큐/락.
+// Stage 4 scale comparison probe.
 //
-// 부하 패턴: Stage 3 와 동일 (100 → 500 → 1000 → 2000 → 3500 → 5000 RPS).
-// 비교 대상: Stage 3 단일 backend 측정값 (queue/queue-load-output.txt).
-//
-// 사용자 행동 → 서버 부위 → 무엇 때문에 → 사용자가 보는 결과:
-//   행동: 사용자가 LB 주소(28093)로 토큰 요청 → admit 폴링 → 좌석 클릭
-//   서버: Nginx → app1 또는 app2 (round-robin) → RedisWaitingQueue / DistributedSeatLock
-//        → SeatRepository.casHold (fencing token 검증)
-//   원인: backend 가 2 대라 throughput 이 단일 대비 ~1.8x 가능 (LB overhead 감안)
-//        Redis 가 큐/락의 단일 진실원 — admit/lock 상태가 모든 인스턴스에서 동일
-//   결과: token_issued / admitted / reserve_success / reserve_failed / 인스턴스별 라우팅 분포
+// 목적:
+// - 5K RPS 한계 탐색이 아니라 backend 1대/2대 비교가 가능한 조건을 만든다.
+// - Redis timeout, k6 dropped iterations, macOS ephemeral port 고갈이 먼저 터지지 않는 범위에서 측정한다.
 
 import http from 'k6/http';
 import { sleep } from 'k6';
-import { Counter, Trend } from 'k6/metrics';
 import exec from 'k6/execution';
+import { Counter, Trend } from 'k6/metrics';
 
 http.setResponseCallback(http.expectedStatuses({ min: 200, max: 399 }, 409));
 
 const HOST = __ENV.HOST || 'localhost:28093';
-const SPEC = __ENV.SPEC || 'unknown';
-const SEAT_MAX = parseInt(__ENV.SEAT_MAX || 50000);
+const SPEC = __ENV.SPEC || 'stage4-scale';
+const SEAT_MAX = parseInt(__ENV.SEAT_MAX || '50000');
+const SCALE_TARGETS = (__ENV.SCALE_TARGETS || '100,250,400,550,700')
+  .split(',')
+  .map((v) => parseInt(v.trim(), 10))
+  .filter((v) => !Number.isNaN(v));
+const SCALE_DURATIONS = (__ENV.SCALE_DURATIONS || '20s,20s,30s,30s,30s')
+  .split(',')
+  .map((v) => v.trim())
+  .filter(Boolean);
+const START_RATE = parseInt(__ENV.START_RATE || '50', 10);
+const PRE_ALLOCATED_VUS = parseInt(__ENV.PRE_ALLOCATED_VUS || '300', 10);
+const MAX_VUS = parseInt(__ENV.MAX_VUS || '1200', 10);
+const DROPPED_THRESHOLD = parseInt(__ENV.DROPPED_THRESHOLD || '100', 10);
 
 const tokenIssued = new Counter('token_issued');
 const admitted = new Counter('admitted');
@@ -29,6 +34,7 @@ const reserveFailed = new Counter('reserve_failed');
 const reserveConflict = new Counter('reserve_conflict');
 const admitTimeout = new Counter('admit_timeout');
 const tokenFailed = new Counter('token_failed');
+
 const admitWaitMs = new Trend('admit_wait_ms', true);
 const totalLatency = new Trend('total_latency_ms', true);
 const tokenLatency = new Trend('token_latency_ms', true);
@@ -39,34 +45,30 @@ export const options = {
   scenarios: {
     ramp: {
       executor: 'ramping-arrival-rate',
-      startRate: 100,
+      startRate: START_RATE,
       timeUnit: '1s',
-      preAllocatedVUs: 500,
-      maxVUs: 5000,
-      stages: [
-        { target: 100,  duration: '20s' },
-        { target: 500,  duration: '30s' },
-        { target: 1000, duration: '30s' },
-        { target: 2000, duration: '30s' },
-        { target: 3500, duration: '30s' },
-        { target: 5000, duration: '30s' },
-      ],
-      tags: { spec: SPEC, scenario: 'ramp' },
+      preAllocatedVUs: PRE_ALLOCATED_VUS,
+      maxVUs: MAX_VUS,
+      stages: SCALE_TARGETS.map((target, index) => ({
+        target,
+        duration: SCALE_DURATIONS[index] || SCALE_DURATIONS[SCALE_DURATIONS.length - 1] || '30s',
+      })),
+      tags: { spec: SPEC, scenario: 'scale-ramp' },
     },
   },
   thresholds: {
-    'total_latency_ms': ['p(99)<60000'],
+    dropped_iterations: [`count<${DROPPED_THRESHOLD}`],
+    token_failed: ['count<100'],
   },
 };
 
 export default function () {
-  const userId = `q-${__VU}-${__ITER}-${Date.now()}`;
+  const userId = `scale-${__VU}-${__ITER}-${Date.now()}`;
   const start = Date.now();
 
-  // Step 1: 토큰 발급
   const tokenRes = http.post(`http://${HOST}/waiting/tokens`, null, {
     headers: { 'X-User-Id': userId },
-    timeout: '10s',
+    timeout: '5s',
     tags: { step: 'token', name: 'POST /waiting/tokens' },
   });
   tokenLatency.add(tokenRes.timings.duration);
@@ -74,11 +76,10 @@ export default function () {
     tokenFailed.add(1);
     return;
   }
-  tokenIssued.add(1);
+
   let token;
   try {
-    const body = tokenRes.json();
-    token = body && body.token;
+    token = tokenRes.json().token;
   } catch (e) {
     tokenFailed.add(1);
     return;
@@ -87,47 +88,42 @@ export default function () {
     tokenFailed.add(1);
     return;
   }
+  tokenIssued.add(1);
 
-  // Step 2: admit 폴링 (최대 20초)
   const admitStart = Date.now();
   let admittedFlag = false;
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 20; i++) {
     const statusRes = http.get(`http://${HOST}/waiting/tokens/${token}`, {
-      timeout: '5s',
+      timeout: '3s',
       tags: { step: 'status', name: 'GET /waiting/tokens/{token}' },
     });
     if (statusRes.status === 200) {
       try {
-        const body = statusRes.json();
-        if (body.admitted) {
+        if (statusRes.json().admitted) {
           admittedFlag = true;
-          admitWaitMs.add(Date.now() - admitStart);
           admitted.add(1);
+          admitWaitMs.add(Date.now() - admitStart);
           break;
         }
-      } catch (e) { }
+      } catch (e) {}
     }
-    sleep(0.2);
+    sleep(0.1);
   }
   if (!admittedFlag) {
     admitTimeout.add(1);
     return;
   }
 
-  // Step 3: 좌석 예약
   const seatId = (exec.scenario.iterationInTest % SEAT_MAX) + 1;
-  const reserveRes = http.post(
-    `http://${HOST}/seats/${seatId}/reservations`,
-    null,
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-User-Id': userId,
-        'X-Waiting-Token': token,
-      },
-      timeout: '10s',
-      tags: { step: 'reserve', name: 'POST /seats/{seatId}/reservations' },
-    });
+  const reserveRes = http.post(`http://${HOST}/seats/${seatId}/reservations`, null, {
+    headers: {
+      'Content-Type': 'application/json',
+      'X-User-Id': userId,
+      'X-Waiting-Token': token,
+    },
+    timeout: '5s',
+    tags: { step: 'reserve', name: 'POST /seats/{seatId}/reservations' },
+  });
   reserveLatency.add(reserveRes.timings.duration);
   if (reserveRes.status === 201 || reserveRes.status === 200) {
     reserveSuccess.add(1);

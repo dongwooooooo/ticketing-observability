@@ -1,0 +1,16 @@
+started_at=2026-05-27T02:29:02+09:00
+mode=single
+load_profile=opening
+app_cpu=4
+app_mem=4g
+db_cpu=2
+db_mem=2g
+redis_cpu=2
+redis_mem=2g
+nginx_cpu=0.5
+pool_size=20
+admit_rate_per_tick=250
+java_opts=-Xmx1500m -XX:+UseG1GC -XX:MaxGCPauseMillis=200
+k6_script=/Users/idong-u/d/ticketing-observability/stage4-capacity/k6/opening-surge.js
+k6_exit_code=0
+finished_at=2026-05-27T02:30:43+09:00

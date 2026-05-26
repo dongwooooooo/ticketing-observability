@@ -14,19 +14,50 @@ scrape_configs:
         labels:
           stage: basic
       - targets:
-          - host.docker.internal:28081
+          - host.docker.internal:28091
         labels:
           stage: concurrency
       - targets:
-          - host.docker.internal:28082
+          - host.docker.internal:28092
         labels:
           stage: queue
+      - targets:
+          - host.docker.internal:28083
+        labels:
+          stage: distributed
+          app_instance: app1
+      - targets:
+          - host.docker.internal:28084
+        labels:
+          stage: distributed
+          app_instance: app2
 
   - job_name: pushgateway
     honor_labels: true
     static_configs:
       - targets:
           - pushgateway:9091
+
+  - job_name: stage4-redis
+    static_configs:
+      - targets:
+          - host.docker.internal:9121
+        labels:
+          stage: distributed
+          component: redis
+
+  - job_name: stage4-postgres
+    static_configs:
+      - targets:
+          - host.docker.internal:9187
+        labels:
+          stage: distributed
+          component: postgres
+
+  - job_name: cadvisor
+    static_configs:
+      - targets:
+          - cadvisor:8080
 
   - job_name: prometheus
     static_configs:

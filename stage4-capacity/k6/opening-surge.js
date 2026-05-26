@@ -1,26 +1,33 @@
-// Stage 4 capacity probe — backend × 2 + Nginx LB + Redis 분산 큐/락.
+// Stage 4 opening surge probe.
 //
-// 부하 패턴: Stage 3 와 동일 (100 → 500 → 1000 → 2000 → 3500 → 5000 RPS).
-// 비교 대상: Stage 3 단일 backend 측정값 (queue/queue-load-output.txt).
-//
-// 사용자 행동 → 서버 부위 → 무엇 때문에 → 사용자가 보는 결과:
-//   행동: 사용자가 LB 주소(28093)로 토큰 요청 → admit 폴링 → 좌석 클릭
-//   서버: Nginx → app1 또는 app2 (round-robin) → RedisWaitingQueue / DistributedSeatLock
-//        → SeatRepository.casHold (fencing token 검증)
-//   원인: backend 가 2 대라 throughput 이 단일 대비 ~1.8x 가능 (LB overhead 감안)
-//        Redis 가 큐/락의 단일 진실원 — admit/lock 상태가 모든 인스턴스에서 동일
-//   결과: token_issued / admitted / reserve_success / reserve_failed / 인스턴스별 라우팅 분포
+// 목적:
+// - 티켓 오픈 시각에 요청이 바로 몰리는 상황을 재현한다.
+// - 낮은 부하에서 천천히 올리는 ramp가 아니라, 높은 시작 부하에서 더 높아지는 흐름을 사용한다.
+// - backend 1대/2대 비교에서 포화 시점, timeout, dropped iterations, 대기 시간을 확인한다.
 
 import http from 'k6/http';
 import { sleep } from 'k6';
-import { Counter, Trend } from 'k6/metrics';
 import exec from 'k6/execution';
+import { Counter, Trend } from 'k6/metrics';
 
 http.setResponseCallback(http.expectedStatuses({ min: 200, max: 399 }, 409));
 
 const HOST = __ENV.HOST || 'localhost:28093';
-const SPEC = __ENV.SPEC || 'unknown';
-const SEAT_MAX = parseInt(__ENV.SEAT_MAX || 50000);
+const SPEC = __ENV.SPEC || 'stage4-opening';
+const SEAT_MAX = parseInt(__ENV.SEAT_MAX || '50000', 10);
+
+const START_RATE = parseInt(__ENV.OPENING_START_RATE || '600', 10);
+const OPENING_TARGETS = (__ENV.OPENING_TARGETS || '600,800,1000,1200')
+  .split(',')
+  .map((v) => parseInt(v.trim(), 10))
+  .filter((v) => !Number.isNaN(v));
+const OPENING_DURATIONS = (__ENV.OPENING_DURATIONS || '25s,25s,25s,25s')
+  .split(',')
+  .map((v) => v.trim())
+  .filter(Boolean);
+const PRE_ALLOCATED_VUS = parseInt(__ENV.PRE_ALLOCATED_VUS || '1200', 10);
+const MAX_VUS = parseInt(__ENV.MAX_VUS || '3000', 10);
+const DROPPED_THRESHOLD = parseInt(__ENV.DROPPED_THRESHOLD || '500', 10);
 
 const tokenIssued = new Counter('token_issued');
 const admitted = new Counter('admitted');
@@ -29,6 +36,7 @@ const reserveFailed = new Counter('reserve_failed');
 const reserveConflict = new Counter('reserve_conflict');
 const admitTimeout = new Counter('admit_timeout');
 const tokenFailed = new Counter('token_failed');
+
 const admitWaitMs = new Trend('admit_wait_ms', true);
 const totalLatency = new Trend('total_latency_ms', true);
 const tokenLatency = new Trend('token_latency_ms', true);
@@ -37,36 +45,32 @@ const reserveLatency = new Trend('reserve_latency_ms', true);
 export const options = {
   systemTags: ['status', 'method', 'name', 'scenario', 'expected_response'],
   scenarios: {
-    ramp: {
+    opening_surge: {
       executor: 'ramping-arrival-rate',
-      startRate: 100,
+      startRate: START_RATE,
       timeUnit: '1s',
-      preAllocatedVUs: 500,
-      maxVUs: 5000,
-      stages: [
-        { target: 100,  duration: '20s' },
-        { target: 500,  duration: '30s' },
-        { target: 1000, duration: '30s' },
-        { target: 2000, duration: '30s' },
-        { target: 3500, duration: '30s' },
-        { target: 5000, duration: '30s' },
-      ],
-      tags: { spec: SPEC, scenario: 'ramp' },
+      preAllocatedVUs: PRE_ALLOCATED_VUS,
+      maxVUs: MAX_VUS,
+      stages: OPENING_TARGETS.map((target, index) => ({
+        target,
+        duration: OPENING_DURATIONS[index] || OPENING_DURATIONS[OPENING_DURATIONS.length - 1] || '25s',
+      })),
+      tags: { spec: SPEC, scenario: 'opening-surge' },
     },
   },
   thresholds: {
-    'total_latency_ms': ['p(99)<60000'],
+    dropped_iterations: [`count<${DROPPED_THRESHOLD}`],
+    token_failed: ['count<1000'],
   },
 };
 
 export default function () {
-  const userId = `q-${__VU}-${__ITER}-${Date.now()}`;
+  const userId = `opening-${__VU}-${__ITER}-${Date.now()}`;
   const start = Date.now();
 
-  // Step 1: 토큰 발급
   const tokenRes = http.post(`http://${HOST}/waiting/tokens`, null, {
     headers: { 'X-User-Id': userId },
-    timeout: '10s',
+    timeout: '5s',
     tags: { step: 'token', name: 'POST /waiting/tokens' },
   });
   tokenLatency.add(tokenRes.timings.duration);
@@ -74,11 +78,10 @@ export default function () {
     tokenFailed.add(1);
     return;
   }
-  tokenIssued.add(1);
+
   let token;
   try {
-    const body = tokenRes.json();
-    token = body && body.token;
+    token = tokenRes.json().token;
   } catch (e) {
     tokenFailed.add(1);
     return;
@@ -87,47 +90,42 @@ export default function () {
     tokenFailed.add(1);
     return;
   }
+  tokenIssued.add(1);
 
-  // Step 2: admit 폴링 (최대 20초)
   const admitStart = Date.now();
   let admittedFlag = false;
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 20; i++) {
     const statusRes = http.get(`http://${HOST}/waiting/tokens/${token}`, {
-      timeout: '5s',
+      timeout: '3s',
       tags: { step: 'status', name: 'GET /waiting/tokens/{token}' },
     });
     if (statusRes.status === 200) {
       try {
-        const body = statusRes.json();
-        if (body.admitted) {
+        if (statusRes.json().admitted) {
           admittedFlag = true;
-          admitWaitMs.add(Date.now() - admitStart);
           admitted.add(1);
+          admitWaitMs.add(Date.now() - admitStart);
           break;
         }
-      } catch (e) { }
+      } catch (e) {}
     }
-    sleep(0.2);
+    sleep(0.1);
   }
   if (!admittedFlag) {
     admitTimeout.add(1);
     return;
   }
 
-  // Step 3: 좌석 예약
   const seatId = (exec.scenario.iterationInTest % SEAT_MAX) + 1;
-  const reserveRes = http.post(
-    `http://${HOST}/seats/${seatId}/reservations`,
-    null,
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-User-Id': userId,
-        'X-Waiting-Token': token,
-      },
-      timeout: '10s',
-      tags: { step: 'reserve', name: 'POST /seats/{seatId}/reservations' },
-    });
+  const reserveRes = http.post(`http://${HOST}/seats/${seatId}/reservations`, null, {
+    headers: {
+      'Content-Type': 'application/json',
+      'X-User-Id': userId,
+      'X-Waiting-Token': token,
+    },
+    timeout: '5s',
+    tags: { step: 'reserve', name: 'POST /seats/{seatId}/reservations' },
+  });
   reserveLatency.add(reserveRes.timings.duration);
   if (reserveRes.status === 201 || reserveRes.status === 200) {
     reserveSuccess.add(1);
